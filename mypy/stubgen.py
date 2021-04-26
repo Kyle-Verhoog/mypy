@@ -54,7 +54,7 @@ import argparse
 from collections import defaultdict
 
 from typing import (
-    List, Dict, Tuple, Iterable, Mapping, Optional, Set, cast,
+    List, Dict, Tuple, Iterable, Mapping, Optional, Set, Sequence, cast,
 )
 from typing_extensions import Final
 
@@ -71,8 +71,8 @@ from mypy.modulefinder import (
 from mypy.nodes import (
     Expression, IntExpr, UnaryExpr, StrExpr, BytesExpr, NameExpr, FloatExpr, MemberExpr,
     TupleExpr, ListExpr, ComparisonExpr, CallExpr, IndexExpr, EllipsisExpr,
-    ClassDef, MypyFile, Decorator, AssignmentStmt, TypeInfo,
-    IfStmt, ImportAll, ImportFrom, Import, FuncDef, FuncBase, TempNode, Block,
+    ClassDef, MypyFile, Decorator, AssignmentStmt, TypeInfo, Node, SymbolTableNode,
+    IfStmt, ImportAll, ImportFrom, Import, FuncDef, FuncBase, TempNode, Block, Var,
     Statement, OverloadedFuncDef, ARG_POS, ARG_STAR, ARG_STAR2, ARG_NAMED, ARG_NAMED_OPT
 )
 from mypy.stubgenc import generate_stub_for_c_module
@@ -85,7 +85,7 @@ from mypy.stubdoc import parse_all_signatures, find_unique_signatures, Sig
 from mypy.options import Options as MypyOptions
 from mypy.types import (
     Type, TypeStrVisitor, CallableType, UnboundType, NoneType, TupleType, TypeList, Instance,
-    AnyType
+    AnyType, UnionType
 )
 from mypy.visitor import NodeVisitor
 from mypy.find_sources import create_source_list, InvalidSourceList
@@ -93,6 +93,7 @@ from mypy.build import build
 from mypy.errors import CompileError, Errors
 from mypy.traverser import has_return_statement
 from mypy.moduleinspect import ModuleInspect
+from mypy.lookup import lookup_fully_qualified
 
 
 # Common ways of naming package containing vendored modules.
@@ -172,7 +173,9 @@ class Options:
                  files: List[str],
                  verbose: bool,
                  quiet: bool,
-                 export_less: bool) -> None:
+                 export_less: bool,
+                 public_api_only: bool,
+                 public_api_excludes: List[str]) -> None:
         # See parse_options for descriptions of the flags.
         self.pyversion = pyversion
         self.no_import = no_import
@@ -190,6 +193,10 @@ class Options:
         self.verbose = verbose
         self.quiet = quiet
         self.export_less = export_less
+        self.public_api_only = public_api_only
+        self.public_api_excludes = public_api_excludes
+        if self.public_api_only:
+            self.export_less = True
 
 
 class StubSource:
@@ -439,6 +446,144 @@ class ImportTracker:
         return result
 
 
+def _get_types(typ: Type) -> Sequence[Type]:
+    if isinstance(typ, (UnionType, TypeList, TupleType)):
+        return typ.items
+    # Handle Dict, List, etc
+    elif isinstance(typ, Instance):
+        # Note that typ is included as well since we don't know if the type
+        # is a user defined type.
+        # eg. InternalType[OtherInternalType]
+        return [typ, *typ.args]
+    return [typ]
+
+
+def find_public_api(mods, excludes, files) -> Set[str]:
+    initial_public_api: Set[str] = set()
+
+    modules = [mod.module for mod in mods]
+    for mod in mods:
+        to_add: Set[str] = set()
+        finder = PublicAPIFinder(mods, excludes, to_add, files)
+        mod.ast.accept(finder)
+        initial_public_api |= to_add
+
+    def _in_includes(name: str) -> bool:
+        return any(name.startswith(m) for m in modules)
+
+    # Expand the public API to include any leaked items.
+    public_api: Set[str] = set()
+    to_expand: List[str] = list(initial_public_api)
+    while to_expand:
+        item = to_expand.pop()
+        if item in public_api:
+            continue
+        else:
+            public_api.add(item)
+        node = lookup_fully_qualified(item, files)
+        if not node:
+            continue
+
+        if isinstance(node.node, (FuncDef, Decorator)):
+            if node.type and isinstance(node.type, CallableType):
+                types = map(str, _get_types(node.type.ret_type))
+                for stype in types:
+                    if _in_includes(stype):
+                        to_expand.append(stype)
+
+                for argtype in node.type.arg_types:
+                    types = map(str, _get_types(argtype))
+                    for stype in types:
+                        if _in_includes(stype):
+                            to_expand.append(stype)
+        elif isinstance(node.node, TypeInfo):
+            clsfullname = node.fullname
+            for name, attr in node.node.names.items():
+                if _is_private_name(name):
+                    continue
+                fullname = f"{clsfullname}.{name}"
+                to_expand.append(fullname)
+            for n in node.node.mro:
+                if n.fullname and _in_includes(n.fullname):
+                    to_expand.append(n.fullname)
+        elif isinstance(node.node, Var):
+            if not node.type:
+                continue
+            types = map(str, _get_types(node.type))
+            for stype in list(types):
+                if _in_includes(stype):
+                    to_expand.append(stype)
+        else:
+            print("%r not yet supported" % node.node)
+
+    return public_api
+
+
+def _is_private_name(name: str, fullname: Optional[str] = None) -> bool:
+    if fullname in EXTRA_EXPORTED:
+        return False
+    return name.startswith('_') and (not name.endswith('__')
+                                     or name in IGNORED_DUNDERS)
+
+
+class SkipMypyFile(Exception):
+    pass
+
+
+class PublicAPIFinder(mypy.traverser.TraverserVisitor):
+    def __init__(self, py_mods, excludes, public_api, mods) -> None:
+        self.py_mods = py_mods
+        self.excludes = excludes
+        self.public_api = public_api
+        self.mods: Dict[str, MypyFile] = mods
+
+    def lookup(self, fullname: str) -> Optional[SymbolTableNode]:
+        return lookup_fully_qualified(fullname, self.mods)
+
+    def visit_class_def(self, o: ClassDef) -> None:
+        if o.name.startswith("_"):
+            return
+        else:
+            self.public_api.add(o.fullname)
+            node = self.lookup(o.fullname)
+            super().visit_class_def(o)
+
+    def visit_mypy_file(self, o: MypyFile) -> None:
+        if any(o.fullname.startswith(e) for e in self.excludes):
+            return
+        self.public_api.add(o.fullname)
+        super().visit_mypy_file(o)
+
+    def visit_overloaded_func_def(self, o: OverloadedFuncDef) -> None:
+        pass
+
+    def visit_func_def(self, o: FuncDef, is_abstract: bool = False,
+                       is_overload: bool = False) -> None:
+        if _is_private_name(o.name, o.fullname):
+            return
+        self.public_api.add(o.fullname)
+
+    def visit_decorator(self, o: Decorator) -> None:
+        if _is_private_name(o.name, o.fullname):
+            return
+        self.public_api.add(o.fullname)
+
+    def visit_block(self, o: Block) -> None:
+        # Unreachable statements may be partially uninitialized and that may
+        # cause trouble.
+        if not o.is_unreachable:
+            super().visit_block(o)
+
+    def visit_assignment_stmt(self, o: AssignmentStmt) -> None:
+        for lvalue in o.lvalues:
+            if isinstance(lvalue, NameExpr):
+                if not _is_private_name(lvalue.name):
+                    self.public_api.add(lvalue.fullname)
+
+    def visit_if_stmt(self, o: IfStmt) -> None:
+        pass
+
+
 def find_defined_names(file: MypyFile) -> Set[str]:
     finder = DefinitionFinder()
     file.accept(finder)
@@ -515,7 +660,10 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
                  _all_: Optional[List[str]], pyversion: Tuple[int, int],
                  include_private: bool = False,
                  analyzed: bool = False,
-                 export_less: bool = False) -> None:
+                 export_less: bool = False,
+                 public_api_only: bool = False,
+                 public_api: Optional[Set[str]] = None,
+                 files: Optional[Dict[str, MypyFile]] = None) -> None:
         # Best known value of __all__.
         self._all_ = _all_
         self._output = []  # type: List[str]
@@ -530,6 +678,9 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
         self._toplevel_names = []  # type: List[str]
         self._pyversion = pyversion
         self._include_private = include_private
+        self._public_api_only = public_api_only
+        self._public_api: Set[str] = public_api if public_api else set()
+        self._files = files if files else {}
         self.import_tracker = ImportTracker()
         # Was the tree semantically analysed before?
         self.analyzed = analyzed
@@ -545,7 +696,18 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
         # Short names of methods defined in the body of the current class
         self.method_names = set()  # type: Set[str]
 
+    def _include(self, name: str) -> bool:
+        if self._public_api_only and name not in self._public_api:
+            return False
+        return True
+
+    def lookup_fully_qualified(self, name: str) -> Optional[SymbolTableNode]:
+        return lookup_fully_qualified(name, self._files)
+
     def visit_mypy_file(self, o: MypyFile) -> None:
+        if not any(i.startswith(o.fullname) for i in self._public_api):
+            raise SkipMypyFile
+
         self.module = o.fullname  # Current module being processed
         self.path = o.path
         self.defined_names = find_defined_names(o)
@@ -589,22 +751,44 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
                 # skip the overload implementation and clear the decorator we just processed
                 self.clear_decorators()
 
+    def add_type_imports(self, typ: Type):
+        for t in map(str, _get_types(typ)):
+            if t == "None":
+                continue
+            self.import_tracker.add_import(t)
+
     def visit_func_def(self, o: FuncDef, is_abstract: bool = False,
                        is_overload: bool = False) -> None:
         if (self.is_private_name(o.name, o.fullname)
                 or self.is_not_in_all(o.name)
-                or (self.is_recorded_name(o.name) and not is_overload)):
+                or (self.is_recorded_name(o.name) and not is_overload)
+                or not self._include(o.fullname)):
             self.clear_decorators()
             return
         if not self._indent and self._state not in (EMPTY, FUNC) and not o.is_awaitable_coroutine:
             self.add('\n')
         if not self.is_top_level():
             self_inits = find_self_initializers(o)
+
+            cls_node: Optional[SymbolTableNode] = None
+            # Dirty hack because I don't see a way to get the current class
+            # if it exists.
+            split = o.fullname.split(".")
+            if len(split) > 1:
+                fullname = ".".join(split[0:-1])
+                cls_node = self.lookup_fully_qualified(fullname)
+
             for init, value in self_inits:
                 if init in self.method_names:
                     # Can't have both an attribute and a method/property with the same name.
                     continue
-                init_code = self.get_init(init, value)
+
+                init_annotation = None
+                if cls_node and isinstance(cls_node.node, TypeInfo):
+                    attr_node = cls_node.node.names[init]  # should always exist?
+                    init_annotation = attr_node.type
+
+                init_code = self.get_init(init, value, init_annotation)
                 if init_code:
                     self.add(init_code)
         # dump decorators, just before "def ..."
@@ -614,12 +798,19 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
         self.add("%s%sdef %s(" % (self._indent, 'async ' if o.is_coroutine else '', o.name))
         self.record_name(o.name)
         args = []  # type: List[str]
+        node = self.lookup_fully_qualified(o.fullname)
         for i, arg_ in enumerate(o.arguments):
             var = arg_.variable
             kind = arg_.kind
             name = var.name
             annotated_type = (o.unanalyzed_type.arg_types[i]
                               if isinstance(o.unanalyzed_type, CallableType) else None)
+            if node and isinstance(node.node, (FuncDef, Decorator)):
+                if node.type and isinstance(node.type, CallableType):
+                    arg_type = node.type.arg_types[i]
+                    annotated_type = arg_type
+                    self.add_type_imports(arg_type)
+
             # I think the name check is incorrect: there are libraries which
             # name their 0th argument other than self/cls
             is_self_arg = i == 0 and name == 'self'
@@ -653,6 +844,11 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
                 arg = name + annotation
             args.append(arg)
         retname = None
+        if node and isinstance(node.type, CallableType):
+            ret_type = node.type.ret_type
+            retname = self.print_annotation(ret_type)
+            self.add_type_imports(ret_type)
+
         if o.name != '__init__' and isinstance(o.unanalyzed_type, CallableType):
             retname = self.print_annotation(o.unanalyzed_type.ret_type)
         elif isinstance(o, FuncDef) and (o.is_abstract or o.name in METHODS_WITH_RETURN_VALUE):
@@ -791,6 +987,9 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
         return is_abstract, is_overload
 
     def visit_class_def(self, o: ClassDef) -> None:
+        if not self._include(o.fullname):
+            return
+
         self.method_names = find_method_names(o.defs.body)
         sep = None  # type: Optional[int]
         if not self._indent and self._state != EMPTY:
@@ -875,7 +1074,10 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
             sep = False
             found = False
             for item, annotation in zip(items, annotations):
-                if isinstance(item, NameExpr):
+                if isinstance(item, NameExpr) and item.fullname:
+                    node = self.lookup_fully_qualified(item.fullname)
+                    if node and node.type:
+                        annotation = node.type
                     init = self.get_init(item.name, o.rvalue, annotation)
                     if init:
                         found = True
@@ -1131,10 +1333,7 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
     def is_private_name(self, name: str, fullname: Optional[str] = None) -> bool:
         if self._include_private:
             return False
-        if fullname in EXTRA_EXPORTED:
-            return False
-        return name.startswith('_') and (not name.endswith('__')
-                                         or name in IGNORED_DUNDERS)
+        return _is_private_name(name, fullname)
 
     def is_private_member(self, fullname: str) -> bool:
         parts = fullname.split('.')
@@ -1404,6 +1603,8 @@ def mypy_options(stubgen_options: Options) -> MypyOptions:
     options.python_version = stubgen_options.pyversion
     options.show_traceback = True
     options.transform_source = remove_misplaced_type_comments
+    if stubgen_options.public_api_only:
+        options.export_types = True
     return options
 
 
@@ -1431,16 +1632,16 @@ def parse_source_file(mod: StubSource, mypy_options: MypyOptions) -> None:
 def generate_asts_for_modules(py_modules: List[StubSource],
                               parse_only: bool,
                               mypy_options: MypyOptions,
-                              verbose: bool) -> None:
+                              verbose: bool) -> Optional[Dict[str, MypyFile]]:
     """Use mypy to parse (and optionally analyze) source files."""
     if not py_modules:
-        return  # Nothing to do here, but there may be C modules
+        return None  # Nothing to do here, but there may be C modules
     if verbose:
         print('Processing %d files...' % len(py_modules))
     if parse_only:
         for mod in py_modules:
             parse_source_file(mod, mypy_options)
-        return
+        return None
     # Perform full semantic analysis of the source set.
     try:
         res = build([module.source for module in py_modules], mypy_options)
@@ -1452,6 +1653,7 @@ def generate_asts_for_modules(py_modules: List[StubSource],
         # Use statically inferred __all__ if there is no runtime one.
         if mod.runtime_all is None:
             mod.runtime_all = res.manager.semantic_analyzer.export_map[mod.module]
+    return res.files
 
 
 def generate_stub_from_ast(mod: StubSource,
@@ -1459,7 +1661,10 @@ def generate_stub_from_ast(mod: StubSource,
                            parse_only: bool = False,
                            pyversion: Tuple[int, int] = defaults.PYTHON3_VERSION,
                            include_private: bool = False,
-                           export_less: bool = False) -> None:
+                           export_less: bool = False,
+                           public_api_only: bool = False,
+                           public_api: Optional[Set[str]] = None,
+                           files: Optional[Dict[str, MypyFile]] = None) -> None:
     """Use analysed (or just parsed) AST to generate type stub for single file.
 
     If directory for target doesn't exist it will created. Existing stub
@@ -1469,9 +1674,16 @@ def generate_stub_from_ast(mod: StubSource,
                         pyversion=pyversion,
                         include_private=include_private,
                         analyzed=not parse_only,
-                        export_less=export_less)
+                        export_less=export_less,
+                        public_api_only=public_api_only,
+                        public_api=public_api,
+                        files=files)
     assert mod.ast is not None, "This function must be used only with analyzed modules"
-    mod.ast.accept(gen)
+
+    try:
+        mod.ast.accept(gen)
+    except SkipMypyFile:
+        return
 
     # Write output to file.
     subdir = os.path.dirname(target)
@@ -1509,8 +1721,15 @@ def generate_stubs(options: Options) -> None:
     if options.doc_dir:
         sigs, class_sigs = collect_docs_signatures(options.doc_dir)
 
+
     # Use parsed sources to generate stubs for Python modules.
-    generate_asts_for_modules(py_modules, options.parse_only, mypy_opts, options.verbose)
+    mypy_files = generate_asts_for_modules(py_modules, options.parse_only, mypy_opts, options.verbose)
+
+    if options.public_api_only:
+        public_api = find_public_api(py_modules, options.public_api_excludes, mypy_files)
+    else:
+        public_api = set()
+
     files = []
     for mod in py_modules:
         assert mod.path is not None, "Not found module was not skipped"
@@ -1525,7 +1744,10 @@ def generate_stubs(options: Options) -> None:
             generate_stub_from_ast(mod, target,
                                    options.parse_only, options.pyversion,
                                    options.include_private,
-                                   options.export_less)
+                                   options.export_less,
+                                   options.public_api_only,
+                                   public_api,
+                                   mypy_files)
 
     # Separately analyse C modules using different logic.
     for mod in c_modules:
@@ -1602,6 +1824,10 @@ def parse_options(args: List[str]) -> Options:
     parser.add_argument('-p', '--package', action='append', metavar='PACKAGE',
                         dest='packages', default=[],
                         help="generate stubs for package recursively; can be repeated")
+    parser.add_argument('--public-api-only', action='store_true', dest='public_api_only',
+                        help="only generate stubs for the public API")
+    parser.add_argument('--public-api-excludes', default='', dest='public_api_excludes',
+                        help="only generate the public API")
     parser.add_argument(metavar='files', nargs='*', dest='files',
                         help="generate stubs for given files or directories")
 
@@ -1633,7 +1859,9 @@ def parse_options(args: List[str]) -> Options:
                    files=ns.files,
                    verbose=ns.verbose,
                    quiet=ns.quiet,
-                   export_less=ns.export_less)
+                   export_less=ns.export_less,
+                   public_api_only=ns.public_api_only,
+                   public_api_excludes=ns.public_api_excludes.split(":"))
 
 
 def main() -> None:
